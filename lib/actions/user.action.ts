@@ -1,9 +1,24 @@
 "use server";
 
 import { ID } from "node-appwrite";
-import { createAdminClient, createSessionClient } from "../AppWrite";
+import {createAdminClient, createSessionClient} from "../AppWrite";
 import { cookies } from "next/headers";
-import { parseStringify } from "../utils";
+import { encryptId, extractCustomerIdFromUrl, parseStringify } from "../utils";
+import {
+  CountryCode,
+  ProcessorTokenCreateRequest,
+  ProcessorTokenCreateRequestProcessorEnum,
+  Products,
+} from "plaid";
+import { plaidClient } from "../plaid";
+import { revalidatePath } from "next/cache";
+import { addFundingSource, createDwollaCustomer } from "./dwolla.actions";
+
+const {
+  APPWRITE_DATABASE_ID: DATABASE_ID,
+  APPWRITE_USER_COLLECTION_ID: USER_COLLECTION_ID,
+  APPWRITE_BANK_COLLECTION_ID:BANK_COLLECTION_ID,
+} = process.env;
 
 export const signIn = async ({ email, password }: signInProps) => {
   try {
@@ -15,18 +30,45 @@ export const signIn = async ({ email, password }: signInProps) => {
   }
 };
 
-export const signUp = async (userData: SignUpParams) => {
-  const { email, password, firstName, lastName } = userData;
+export const signUp = async ({password,...userData}: SignUpParams) => {
+  const { email, firstName, lastName } = userData;
+
+  let newUserAccount;
 
   try {
-    const { account } = await createAdminClient();
+    const { account,database } = await createAdminClient();
 
-    const newUserAccount = await account.create(
+    newUserAccount = await account.create(
       ID.unique(),
       email,
       password,
       `${firstName} ${lastName}`
     );
+
+    if(!newUserAccount) throw new Error ('Error creating user')
+
+    const dwollaCustomerUrl = await createDwollaCustomer({
+      ...userData,
+      type:'personal'
+    })
+
+    if(!dwollaCustomerUrl) throw new Error('Error creating Dwolla customer')
+
+    const dwollaCustomerId = extractCustomerIdFromUrl(dwollaCustomerUrl)
+
+    const newUser = await database.createDocument(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      ID.unique(),
+      {
+        ...userData,
+        userId:newUserAccount.$id,
+        dwollaCustomerId,
+        dwollaCustomerUrl,
+      }
+    )
+
+
     const session = await account.createEmailPasswordSession(email, password);
 
     cookies().set("appwrite-session", session.secret, {
@@ -35,7 +77,7 @@ export const signUp = async (userData: SignUpParams) => {
       sameSite: "strict",
       secure: true,
     });
-    return parseStringify(newUserAccount);
+    return parseStringify(newUser);
   } catch (error) {
     console.error(error);
   }
@@ -53,10 +95,125 @@ export async function getLoggedInUser() {
 
 export const logOutAccount = async () => {
   try {
-    const {account} = await createSessionClient()
-    cookies().delete('appwrite-session')
-    await account.deleteSession('current')
+    const { account } = await createSessionClient();
+    cookies().delete("appwrite-session");
+    await account.deleteSession("current");
   } catch (error) {
     console.error("An error has occured", error);
+  }
+};
+
+export const createLinkToken = async (user: User) => {
+  try {
+    const tokenParams = {
+      user: {
+        client_user_id: user.$id,
+      },
+      client_name: `${user.firstName} ${user.lastName}`,
+      products: ["auth"] as Products[],
+      language: "en",
+      country_codes: ["US"] as CountryCode[],
+    };
+
+    const response = await plaidClient.linkTokenCreate(tokenParams);
+    return parseStringify({ linkToken: response.data.link_token });
+  } catch (error) {
+    console.log(error);
+  }
+};
+
+export const createBankAccount = async ({
+  userId,
+  bankId,
+  accountId,
+  accessToken,
+  fundingSourceUrl,
+  sharableId,
+}: createBankAccountProps) => {
+  try {
+    const { database } = await createAdminClient();
+
+    const bankAccount = await database.createDocument(
+      DATABASE_ID!,
+      BANK_COLLECTION_ID!,
+      ID.unique(),
+      {
+        userId,
+        bankId,
+        accountId,
+        accessToken,
+        fundingSourceUrl,
+        sharableId,
+      }
+    );
+
+    return parseStringify(bankAccount)
+  } catch (error) {
+    console.log(error);
+  }
+};
+
+export const exchangePublicToken = async ({
+  publicToken,
+  user,
+}: exchangePublicTokenProps) => {
+  try {
+    //exchange public token for access token and item ID
+
+    const response = await plaidClient.itemPublicTokenExchange({
+      public_token: publicToken,
+    });
+
+    const accessToken = response.data.access_token;
+    const itemId = response.data.item_id;
+
+    //get account information from plaid using access token
+    const accountsResponse = await plaidClient.accountsGet({
+      access_token: accessToken,
+    });
+
+    const accountData = accountsResponse.data.accounts[0];
+
+    //create a processor token for dwolla using the access token and account ID
+    const request: ProcessorTokenCreateRequest = {
+      access_token: accessToken,
+      account_id: accountData.account_id,
+      processor: "dwolla" as ProcessorTokenCreateRequestProcessorEnum,
+    };
+
+    const processorTokenResponse = await plaidClient.processorTokenCreate(
+      request
+    );
+    const processorToken = processorTokenResponse.data.processor_token;
+
+    //create a funding source URL for the account using the dwolla customer ID, processor token, and bank name
+    const fundingSourceUrl = await addFundingSource({
+      dwollaCustomerId: user.dwollaCustomerId,
+      processorToken,
+      bankName: accountData.name,
+    });
+
+    //checking if the funding source exists
+    if (!fundingSourceUrl) throw Error;
+
+    //if the funding source exist. Create a bank account using the userId, item ID, account ID, access token, funding source URL, and sharable ID
+    await createBankAccount({
+      userId: user.$id,
+      bankId: itemId,
+      accountId: accountData.account_id,
+      accessToken,
+      fundingSourceUrl,
+      sharableId: encryptId(accountData.account_id),
+    });
+
+    // revalidate the path to reflect the changes
+    revalidatePath("/");
+
+    //return a success message
+    return parseStringify({
+      publicTokenExchange: "complete",
+    });
+  } catch (error) {
+    console.log(error);
   }
 };
